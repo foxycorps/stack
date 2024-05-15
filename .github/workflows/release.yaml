@@ -1,0 +1,171 @@
+name: Deployment
+run-name: ${{ inputs.tag_name }} / go ${{ inputs.go_version }} / ${{ inputs.environment }}
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref_name }}
+    cancel-in-progress: true
+
+permissions:
+    contents: write
+
+on:
+    workflow_dispatch:
+        inputs:
+            tag_name:
+                required: true
+                type: string
+            environment:
+                default: "production"
+                type: string
+            go_version:
+                default: "1.21"
+                type: string
+            platforms:
+                default: "linux,macos,windows"
+                type: string
+            release:
+                description: "Whether to create a Github Release"
+                type: boolean
+                default: true
+
+jobs:
+    linux:
+        runs-on: ubuntu-latest
+        environment: ${{ inputs.environment }}
+        if: contains(inputs.platforms, 'linux')
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                go-version: ${{ inputs.go_version }}
+            - name: Install GoReleaser
+              uses: goreleaser/goreleaser-action@v5
+              with:
+                version: "~1.17.1"
+                install-only: true
+            - name: Build release binaries
+              env:
+                TAG_NAME: ${{ inputs.tag_name }}
+              run: script/release --local "$TAG_NAME" --platform linux
+            - uses: actions/upload-artifact@v3
+              with:
+                name: linux
+                if-no-files-found: error
+                retention-days: 7
+                path: |
+                  dist/*.tar.gz
+                  dist/*.rpm
+                  dist/*.deb
+    
+    macos:
+        runs-on: macos-latest
+        environment: ${{ inputs.environment }}
+        if: contains(inputs.platforms, 'macos')
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                go-version: ${{ inputs.go_version }}
+            - name: Configure macOS signing
+              if: inputs.environment == 'production'
+              env:
+                APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+                APPLE_APPLICATION_CERT: ${{ secrets.APPLE_APPLICATION_CERT }}
+                APPLE_APPLICATION_CERT_PASSWORD: ${{ secrets.APPLE_APPLICATION_CERT_PASSWORD }}
+              run: |
+                keychain="$RUNNER_TEMP/buildagent.keychain"
+                keychain_password="password1"
+
+                security create-keychain -p "$keychain_password" "$keychain"
+                security default-keychain -s "$keychain"
+                security unlock-keychain -p "$keychain_password" "$keychain"
+
+                base64 -D <<<"$APPLE_APPLICATION_CERT" > "$RUNNER_TEMP/cert.p12"
+                security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_APPLICATION_CERT_PASSWORD" -T /usr/bin/codesign
+                security set-key-partition-list -S "apple-tool:,apple:,codesign:" -s -k "$keychain_password" "$keychain"
+                rm "$RUNNER_TEMP/cert.p12"
+            - name: Install GoReleaser
+              uses: goreleaser/goreleaser-action@v5
+              with:
+                version: "~1.17.1"
+                install-only: true
+            - name: Build release binaries
+              env:
+                TAG_NAME: ${{ inputs.tag_name }}
+                APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+                APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+              run: script/release --local "$TAG_NAME" --platform macos
+            - name: Notarize macOS archives
+              if: inputs.environment == 'production'
+              env:
+                APPLE_ID: ${{ secrets.APPLE_ID }}
+                APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+                APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+                APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+              run: |
+                shopt -s failglob
+                script/sign dist/carbon_*_macOS_*.zip
+            - uses: actions/upload-artifact@v3
+              with:
+                name: macos
+                if-no-files-found: error
+                retention-days: 7
+                path: |
+                  dist/*.tar.gz
+                  dist/*.zip
+    
+    windows:
+        runs-on: windows-latest
+        environment: ${{ inputs.environment }}
+        if: contains(inputs.platforms, 'windows')
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                go-version: ${{ inputs.go_version }}
+            - name: Install GoReleaser
+              uses: goreleaser/goreleaser-action@v5
+              with:
+                version: "~1.17.1"
+                install-only: true
+
+    release:
+      runs-on: ubuntu-latest
+      needs: [macos]
+      environment: ${{ inputs.environment }}
+      if: inputs.release
+      steps:
+        - name: Checkout
+          uses: actions/checkout@v4
+        - name: Merge built artifacts
+          uses: actions/download-artifact@v3
+        - name: Prepare release assets
+          env:
+            TAG_NAME: ${{ inputs.tag_name }}
+          run: |
+            shopt -s failglob
+            rm -rf dist
+            mkdir dist
+            mv -v macos/carbon_* dist/
+        - name: Create the release
+          env:
+            TAG_NAME: ${{ inputs.tag_name }}
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          run: |
+            pushd dist
+            shasum -a 256 carbon_* > checksums.txt
+            mv checksums.txt carbon_${TAG_NAME#v}_checksums.txt
+            popd
+            release_args=(
+              "$TAG_NAME"
+              --title "Carbon CLI ${TAG_NAME#v}"
+              --target "$GITHUB_SHA"
+              --generate-notes
+            )
+            script/label-assets dist/carbon_* | xargs gh release create "${release_args[@]}" --
